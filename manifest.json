@@ -1,0 +1,35 @@
+{
+  "manifestVersion": 1,
+  "id": "moxingxia",
+  "name": "模型匣",
+  "version": "0.1.7",
+  "description": "给 Hana 的模型供应商加开关和排序。关掉不用的供应商，主对话框的模型菜单立刻清爽；随时能再打开，配置原样保留。",
+  "minAppVersion": "0.449.0",
+  "trust": "full-access",
+  "install": {
+    "defaultEnabled": true
+  },
+  "activationEvents": [
+    "onStartup"
+  ],
+  "main": "index.js",
+  "capabilities": [
+    "network.fetch"
+  ],
+  "network": {
+    "allowedHosts": [
+      "*"
+    ],
+    "defaultTimeoutMs": 15000
+  },
+  "contributes": {
+    "page": {
+      "title": "模型匣",
+      "route": "/settings",
+      "icon": "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><path d='M4 8 12 3l8 5v8l-8 5-8-5z'/><path d='M4 8l8 5 8-5'/><path d='M12 13v8'/></svg>"
+    },
+    "routes": [
+      "./routes/ui.js"
+    ]
+  }
+}

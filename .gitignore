@@ -1,0 +1,10 @@
+# 本地开发文档与数据，不进仓库
+PROJECT_LOG.md
+PENDING_CHANGES.md
+
+# 运行时数据
+store.json
+*.log
+
+# 依赖（本插件零依赖，保留规则以防将来加）
+node_modules/
