@@ -15,14 +15,16 @@ import {
   triggerProviderRefresh,
   writeCatalogAtomic,
 } from "../lib/host-api.js";
+import { resolveBuiltinProviderIds } from "../lib/builtin.js";
 import {
   buildHidePatch,
   buildShowPatch,
   inspectRuntimeModelOrder,
-  inspectRuntimeProviderOrder,
+  inspectRuntimeProviderOrderDetailed,
   listProviders,
   reorderModelEntries,
   reorderProvidersObject,
+  resolveProviderKind,
   snapshotProvider,
 } from "../lib/catalog.js";
 import {
@@ -43,6 +45,38 @@ function json(body, status = 200) {
 
 function jsonErr(message, status = 400) {
   return json({ ok: false, error: message }, status);
+}
+
+/**
+ * 按未生效 provider 的类型拼提示：内置=定死改不了，自定义=保存了但菜单没跟上。
+ * @param providerResults inspectRuntimeProviderOrderDetailed 的 per-provider 结果
+ * @param providerConfigs catalog.providers
+ * @param builtinIds 内置名单（可 null）
+ * @returns null=全部生效，否则为提示文案
+ */
+function buildSupplierReorderWarning(providerResults, providerConfigs, builtinIds) {
+  if (!providerResults) return null;
+  const failed = providerResults.filter((r) => r.state !== "ok");
+  if (failed.length === 0) return null;
+  const names = (list) => list.map((r) => r.requestedId).join("、");
+  const builtinFailed = failed.filter((r) => (
+    resolveProviderKind(r.requestedId, providerConfigs?.[r.requestedId], builtinIds) === "builtin"
+  ));
+  const customFailed = failed.filter((r) => (
+    resolveProviderKind(r.requestedId, providerConfigs?.[r.requestedId], builtinIds) === "custom"
+  ));
+  const parts = [];
+  if (builtinFailed.length > 0) {
+    parts.push(
+      names(builtinFailed)
+      + " 是 Hana 内置供应商，顺序由内置目录决定，改不了（能隐藏，不能换位）",
+    );
+  }
+  if (customFailed.length > 0) {
+    parts.push("顺序已保存，但 " + names(customFailed) + " 的菜单位置暂时没跟着换");
+  }
+  if (parts.length === 0) parts.push("顺序已保存，但 Hana 菜单暂时没有完全跟着换");
+  return parts.join("；");
 }
 
 function initEnv(ctx) {
@@ -81,11 +115,13 @@ export default function registerPluginUiRoutes(app, ctx) {
     const store = readStore(ctx.dataDir);
     const modelState = await fetchCurrentModels(env.server).catch(() => ({ current: null, activeModel: null }));
     pruneHiddenRecords(store, Object.keys(catalog.providers || {}));
+    const builtinIds = resolveBuiltinProviderIds(env.hanakoHome);
 
     return json({
       ok: true,
       serverOk: true,
-      list: listProviders(catalog, store, modelState),
+      builtinsKnown: builtinIds !== null,
+      list: listProviders(catalog, store, modelState, builtinIds),
     });
   });
 
@@ -113,12 +149,14 @@ export default function registerPluginUiRoutes(app, ctx) {
     }
 
     const modelState = await fetchCurrentModels(env.server).catch(() => null);
+    const effectiveCatalog = readEffectiveCatalog(env.hanakoHome);
+    const providerConfigs = effectiveCatalog?.providers || catalog.providers;
+    const builtinIds = resolveBuiltinProviderIds(env.hanakoHome);
     const runtimeCheck = modelState
-      ? inspectRuntimeProviderOrder(
-        modelState.models,
-        body.ids,
-        readEffectiveCatalog(env.hanakoHome)?.providers || catalog.providers,
-      )
+      ? inspectRuntimeProviderOrderDetailed(modelState.models, body.ids, providerConfigs)
+      : null;
+    const warning = runtimeCheck
+      ? buildSupplierReorderWarning(runtimeCheck.providerResults, providerConfigs, builtinIds)
       : null;
     if (runtimeCheck && !runtimeCheck.matches) {
       return json({
@@ -126,7 +164,8 @@ export default function registerPluginUiRoutes(app, ctx) {
         applied: false,
         saved: true,
         runtimeProviderOrder: runtimeCheck.actualOrder,
-        warning: "顺序已保存，但 Hana 当前版本的模型菜单仍按内置目录展示，暂时没有完全跟着换",
+        providerResults: runtimeCheck.providerResults,
+        warning,
       });
     }
     return json({ ok: true, applied: true, verified: !!runtimeCheck });
@@ -221,19 +260,23 @@ export default function registerPluginUiRoutes(app, ctx) {
       return jsonErr(err.message, 502);
     }
 
-    // Hana 目前对内置 provider 会把 allowlist 模型替换回 Pi SDK 原位，
+    // Hana 对内置 provider 会把 allowlist 模型替换回 Pi SDK 原位，
     // 配置文件顺序可能已保存，但运行时菜单未必采用；保存后立即对账，避免页面报喜不报忧。
     const modelState = await fetchCurrentModels(env.server).catch(() => null);
     const runtimeCheck = modelState
       ? inspectRuntimeModelOrder(modelState.models, name, body.ids)
       : null;
     if (runtimeCheck && !runtimeCheck.matches) {
+      const kind = resolveProviderKind(name, provider, resolveBuiltinProviderIds(env.hanakoHome));
+      const warning = kind === "builtin"
+        ? "顺序已保存，但这是 Hana 内置供应商，模型顺序由内置目录决定，菜单不会跟着换"
+        : "顺序已保存，但 Hana 当前版本的模型菜单暂时没有跟着换";
       return json({
         ok: true,
         applied: false,
         saved: true,
         runtimeProviderId: runtimeCheck.runtimeProviderId,
-        warning: "顺序已保存，但 Hana 当前版本的模型菜单仍按内置目录展示，暂时没有跟着换",
+        warning,
       });
     }
     return json({ ok: true, applied: true, verified: !!runtimeCheck });

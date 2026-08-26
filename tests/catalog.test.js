@@ -9,9 +9,11 @@ import {
   extractModelIds,
   inspectRuntimeModelOrder,
   inspectRuntimeProviderOrder,
+  inspectRuntimeProviderOrderDetailed,
   listProviders,
   reorderModelEntries,
   reorderProvidersObject,
+  resolveProviderKind,
   snapshotProvider,
   validateReorder,
 } from "../lib/catalog.js";
@@ -220,6 +222,64 @@ test("listProviders 组装 hidden/inUse/模型数", () => {
   assert.equal(list[1].id, "minimax");
   assert.equal(list[1].hidden, true);
   assert.equal(list[1].inUse, false);
+});
+
+// ── 内置/自定义判定 ──
+test("resolveProviderKind：命中内置名单=builtin，未命中=custom", () => {
+  const builtinIds = new Set(["deepseek", "minimax", "openai-codex"]);
+  assert.equal(resolveProviderKind("deepseek", {}, builtinIds), "builtin");
+  assert.equal(resolveProviderKind("command code", {}, builtinIds), "custom");
+  assert.equal(resolveProviderKind("minimax", undefined, builtinIds), "builtin");
+});
+
+test("resolveProviderKind：runtimeProviderId 投影参与判定（oauth 别名）", () => {
+  const builtinIds = new Set(["openai-codex"]);
+  const oauth = { capabilities: { chat: { runtimeProviderId: "openai-codex" } } };
+  assert.equal(resolveProviderKind("openai-codex-oauth", oauth, builtinIds), "builtin");
+  assert.equal(resolveProviderKind("openai-codex-oauth", {}, builtinIds), "custom");
+});
+
+test("resolveProviderKind：名单不可用（null/非 Set）时返回 null（未知）", () => {
+  assert.equal(resolveProviderKind("deepseek", {}, null), null);
+  assert.equal(resolveProviderKind("deepseek", {}, undefined), null);
+  assert.equal(resolveProviderKind("deepseek", {}, new Map()), null);
+});
+
+test("listProviders 带名单时输出 kind 字段，缺省时 kind=null", () => {
+  const catalog = { providers: { deepseek: { models: [] }, "command code": { models: [] } } };
+  const builtinIds = new Set(["deepseek"]);
+  const list = listProviders(catalog, {}, {}, builtinIds);
+  assert.equal(list[0].kind, "builtin");
+  assert.equal(list[1].kind, "custom");
+  const without = listProviders(catalog, {}, {});
+  assert.equal(without[0].kind, null);
+});
+
+// ── 逐家对账 ──
+test("inspectRuntimeProviderOrderDetailed：ok/moved/missing 三态", () => {
+  const runtime = [
+    { provider: "deepseek", id: "d1" },
+    { provider: "minimax", id: "m1" },
+    { provider: "command code", id: "c1" },
+  ];
+  const configs = {
+    deepseek: { models: ["d1"] },
+    minimax: { models: ["m1"] },
+    "command code": { models: ["c1"] },
+    hidden: { models: ["h1"] },
+  };
+  const result = inspectRuntimeProviderOrderDetailed(
+    runtime,
+    ["deepseek", "command code", "minimax", "hidden"],
+    configs,
+  );
+  assert.equal(result.matches, false);
+  assert.deepEqual(result.providerResults, [
+    { requestedId: "deepseek", runtimeId: "deepseek", state: "ok", actualIndex: 0, requestedIndex: 0 },
+    { requestedId: "command code", runtimeId: "command code", state: "moved", actualIndex: 2, requestedIndex: 1 },
+    { requestedId: "minimax", runtimeId: "minimax", state: "moved", actualIndex: 1, requestedIndex: 2 },
+    { requestedId: "hidden", runtimeId: "hidden", state: "missing", actualIndex: -1, requestedIndex: 3 },
+  ]);
 });
 
 // ── store：原子读写、快照增删、死记录清理 ──
