@@ -12,6 +12,7 @@ import {
   readCatalog,
   readEffectiveCatalog,
   resolveHanakoHome,
+  resolveLocalProviderFile,
   triggerProviderRefresh,
   writeCatalogAtomic,
 } from "../lib/host-api.js";
@@ -22,6 +23,8 @@ import {
   inspectRuntimeModelOrder,
   inspectRuntimeProviderOrderDetailed,
   listProviders,
+  renameModelEntry,
+  renameProviderDisplay,
   reorderModelEntries,
   reorderProvidersObject,
   resolveProviderKind,
@@ -280,6 +283,103 @@ export default function registerPluginUiRoutes(app, ctx) {
       });
     }
     return json({ ok: true, applied: true, verified: !!runtimeCheck });
+  });
+
+  // ── 供应商改名（只影响模型匣页面显示；主菜单分组头无配置通道）──
+  app.post("/api/providers/:name/rename", async (c) => {
+    const env = initEnv(ctx);
+    if (env.error) return jsonErr(env.error, 503);
+    const name = c.req.param("name");
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body.displayName !== "string") return jsonErr("参数不对");
+
+    const catalog = readCatalog(env.hanakoHome);
+    if (!catalog) return jsonErr("读不到供应商配置", 500);
+    const result = renameProviderDisplay(catalog, name, body.displayName);
+    if (result.error) return jsonErr(result.error);
+    try {
+      writeCatalogAtomic(env.hanakoHome, catalog);
+    } catch (err) {
+      return jsonErr("写配置失败：" + (err?.message || String(err)), 500);
+    }
+    return json({ ok: true, ...result });
+  });
+
+  // ── 模型改名（主菜单跟着变；hint：Hana 设置页重新发现模型可能冲掉 name）──
+  app.post("/api/providers/:name/models/rename", async (c) => {
+    const env = initEnv(ctx);
+    if (env.error) return jsonErr(env.error, 503);
+    const name = c.req.param("name");
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body.modelId !== "string" || typeof body.name !== "string") {
+      return jsonErr("参数不对");
+    }
+
+    const effective = readEffectiveCatalog(env.hanakoHome);
+    const provider = effective?.providers?.[name];
+    if (!provider) return jsonErr("这家供应商不存在", 404);
+
+    // models 源判定（实测结论）：catalog 显式 models 带 name 会进运行时；
+    // provider-plugins 定义文件的 name 不被 Hana 采用（models.json 的元数据来自发现逻辑）。
+    // 所以 provider-plugins 型供应商改名时，把完整模型列表白名单化写进 catalog 再改名。
+    const catalog = readCatalog(env.hanakoHome);
+    const catalogProvider = catalog?.providers?.[name];
+    const catalogHasModels = isPlainObject(catalogProvider) && Array.isArray(catalogProvider.models);
+    if (!catalogHasModels && !resolveLocalProviderFile(env.hanakoHome, name)) {
+      return jsonErr("找不到这个供应商的模型列表", 500);
+    }
+
+    let targetModels = null;
+    if (catalogHasModels) {
+      targetModels = catalogProvider.models;
+    } else {
+      const effectiveModels = Array.isArray(provider.models) ? provider.models : [];
+      if (effectiveModels.length === 0) return jsonErr("这个供应商还没有模型，先配了模型再改名", 400);
+      catalogProvider.models = structuredClone(effectiveModels);
+      targetModels = catalogProvider.models;
+    }
+
+    const result = renameModelEntry(targetModels, body.modelId, body.name);
+    if (result.error) return jsonErr(result.error);
+
+    try {
+      writeCatalogAtomic(env.hanakoHome, catalog);
+    } catch (err) {
+      return jsonErr("写配置失败：" + (err?.message || String(err)), 500);
+    }
+
+    // 触发 Hana 刷新，让改名进入运行时菜单
+    try {
+      await triggerProviderRefresh(env.server, name);
+    } catch (err) {
+      return jsonErr("名字已写入，但刷新模型菜单失败：" + (err?.message || String(err)), 502);
+    }
+
+    // 对账：设置新名时断言运行时 name 跟上了；还原默认时若运行时残留旧名则明确提示
+    const modelState = await fetchCurrentModels(env.server).catch(() => null);
+    const runtime = modelState?.models?.find((m) => m.provider === name && m.id === body.modelId);
+    if (result.restored) {
+      if (runtime && result.previousName && runtime.name === result.previousName) {
+        return json({
+          ok: true,
+          applied: false,
+          saved: true,
+          ...result,
+          warning: "配置已还原，但菜单里还留着旧名字——需要去 Hana 设置页『重新发现模型』才会变回默认名",
+        });
+      }
+      return json({ ok: true, applied: true, verified: !!runtime, ...result });
+    }
+    if (runtime && runtime.name !== result.name) {
+      return json({
+        ok: true,
+        applied: false,
+        saved: true,
+        ...result,
+        warning: "名字已保存，但 Hana 菜单暂时没显示新名字（可能是内置目录优先，或设置页重新发现模型时被冲掉）",
+      });
+    }
+    return json({ ok: true, applied: true, verified: !!runtime, ...result });
   });
 
   // ── 检查更新（分享版必带；仓库地址写死，不依赖环境变量）──

@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "moxingxia",
   "name": "模型匣",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "给 Hana 的模型供应商加开关和排序。关掉不用的供应商，主对话框的模型菜单立刻清爽；随时能再打开，配置原样保留。",
   "minAppVersion": "0.449.0",
   "trust": "full-access",

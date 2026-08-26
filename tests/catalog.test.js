@@ -11,6 +11,8 @@ import {
   inspectRuntimeProviderOrder,
   inspectRuntimeProviderOrderDetailed,
   listProviders,
+  renameModelEntry,
+  renameProviderDisplay,
   reorderModelEntries,
   reorderProvidersObject,
   resolveProviderKind,
@@ -195,6 +197,49 @@ test("reorderModelEntries 重排模型且保留对象字段", () => {
   assert.deepEqual(out.models, [current[2], current[0], current[1]]);
   assert.equal(out.models[0].context, 1000000);
   assert.equal(out.models[2].reasoning, true);
+});
+
+// ── 改名 ──
+test("renameModelEntry：字符串条目改成对象带 name", () => {
+  const models = ["m1", "m2"];
+  const out = renameModelEntry(models, "m1", "模型一");
+  assert.deepEqual(models, [{ id: "m1", name: "模型一" }, "m2"]);
+  assert.deepEqual(out, { modelId: "m1", name: "模型一", restored: false });
+});
+
+test("renameModelEntry：对象条目改 name 保留其他字段", () => {
+  const models = [{ id: "m1", name: "旧名", reasoning: true, context: 100 }];
+  renameModelEntry(models, "m1", "新名");
+  assert.deepEqual(models, [{ id: "m1", name: "新名", reasoning: true, context: 100 }]);
+});
+
+test("renameModelEntry：空串/同名还原默认（字符串或去 name）", () => {
+  const a = [{ id: "m1", name: "新名" }];
+  renameModelEntry(a, "m1", "");
+  assert.equal(a[0], "m1");
+  const b = [{ id: "m1", name: "新名", reasoning: true }];
+  const out = renameModelEntry(b, "m1", "m1");
+  assert.deepEqual(b, [{ id: "m1", reasoning: true }]);
+  assert.equal(out.restored, true);
+  assert.equal(out.name, null);
+  assert.equal(out.previousName, "新名");
+});
+
+test("renameModelEntry：找不到模型返回错误且不改数组", () => {
+  const models = ["m1"];
+  const out = renameModelEntry(models, "nope", "新名");
+  assert.ok(out.error);
+  assert.deepEqual(models, ["m1"]);
+});
+
+test("renameProviderDisplay：写 display_name / 还原删字段", () => {
+  const catalog = { providers: { deepseek: { api_key: "k" }, minimax: {} } };
+  const out = renameProviderDisplay(catalog, "deepseek", "豆包");
+  assert.equal(catalog.providers.deepseek.display_name, "豆包");
+  assert.equal(out.restored, false);
+  renameProviderDisplay(catalog, "deepseek", "  ");
+  assert.equal("display_name" in catalog.providers.deepseek, false);
+  assert.equal(renameProviderDisplay(catalog, "不存在", "x").error, "这家供应商不存在");
 });
 
 test("reorderModelEntries 处理重复 id 时不丢条目", () => {
