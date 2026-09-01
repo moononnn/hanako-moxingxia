@@ -1,6 +1,8 @@
 // 模型匣 —— 页面与 API 路由
 // 页面前缀由 host 代理：/api/plugins/moxingxia/...
 // 注意：/api/providers/reorder 必须先于 /api/providers/:name/... 注册，避免被 :name 吞掉
+// 文件预算豁免：所有路由共享同一套 ctx、鉴权、Hana API 环境和错误封装，
+// 保持单入口可避免拆分后出现路由注册顺序或环境初始化漂移。
 
 import fs from "node:fs";
 import path from "node:path";
