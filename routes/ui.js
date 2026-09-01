@@ -41,7 +41,17 @@ import {
   writeStore,
 } from "../lib/store.js";
 import { renderPage } from "../lib/page.js";
-import { readUsageLedger, summarizeUsage, buildRestorePatch } from "../lib/failwatch.js";
+import {
+  FAILWATCH_SLOTS,
+  FAILWATCH_SLOT_LABELS,
+  readUsageLedger,
+  summarizeUsage,
+  normalizeFailwatchSlots,
+  isActiveFallbackSlot,
+  buildManualRestorePlan,
+  finalizeManualRestoreState,
+  listProtectedProviderSlots,
+} from "../lib/failwatch.js";
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -99,6 +109,9 @@ export default function registerPluginUiRoutes(app, ctx) {
   app.get("/api/failwatch/status", async (c) => {
     const store = readStore(ctx.dataDir);
     const fw = store.failwatch || {};
+    const slots = normalizeFailwatchSlots(fw);
+    const activeSlots = FAILWATCH_SLOTS.filter((key) => isActiveFallbackSlot(slots[key]));
+    const enabled = Object.values(fw.backup || {}).some((ref) => typeof ref === "string" && ref.trim());
 
     // 消耗量：读 usage-ledger.json，统计近 24h 的 utility / 插件子系统用量
     let usage = null;
@@ -121,9 +134,12 @@ export default function registerPluginUiRoutes(app, ctx) {
 
     return json({
       ok: true,
-      enabled: !!fw.backup,
+      mode: "manual-restore",
+      enabled,
       backup: fw.backup || null,
-      degraded: !!fw.degraded,
+      degraded: activeSlots.length > 0,
+      activeSlots,
+      slots,
       degradedAt: fw.degradedAt || null,
       consecutiveFailures: fw.consecutiveFailures || 0,
       lastFailureAt: fw.lastFailureAt || null,
@@ -263,9 +279,21 @@ export default function registerPluginUiRoutes(app, ctx) {
 
     const store = readStore(ctx.dataDir);
     const fw = store.failwatch || {};
-    // 保存备用配置；若当前处于降级态，同时把 lastDegradePatch 更新（恢复时用新配置）
+    const activeSlots = FAILWATCH_SLOTS.filter((key) => isActiveFallbackSlot(normalizeFailwatchSlots(fw)[key]));
+    if (activeSlots.length > 0) {
+      return jsonErr("当前正在使用备用模型，先手动切回主模型再修改备用配置", 409);
+    }
+    // 保存备用配置；省略的槽位表示清空该槽位，不影响当前主模型配置。
     fw.backup = clean;
-    if (fw.degraded) fw.lastDegradePatch = clean;
+    // 用户重新保存备用配置，代表愿意重新启用之前人工接管过的槽位。
+    const slots = normalizeFailwatchSlots(fw);
+    for (const key of Object.keys(clean)) {
+      if (slots[key]?.mode === "manual") {
+        slots[key] = { ...slots[key], mode: "primary", manualTakenOver: false, consecutiveFailures: 0, visionFailures: 0 };
+      }
+    }
+    fw.slots = slots;
+    fw.manualTakenOver = false;
     fw.events = Array.isArray(fw.events) ? fw.events : [];
     store.failwatch = fw;
     writeStore(ctx.dataDir, store);
@@ -276,38 +304,59 @@ export default function registerPluginUiRoutes(app, ctx) {
   app.post("/api/failwatch/reset", async (c) => {
     const store = readStore(ctx.dataDir);
     const fw = store.failwatch || {};
-    // 快照-恢复制：优先写回降级前快照；没快照时退化旧行为（清空回退 chat）
-    const patch = buildRestorePatch(fw.lastDegradePatch || fw.backup, fw.snapshot || null);
-    // 只有降级态才有东西可恢复
+    const env = initEnv(ctx);
+    if (env.error) return jsonErr(env.error, 503);
+
+    // 恢复前先读回当前配置；某个槽位被用户手动改过时，只跳过该槽位，绝不覆盖。
+    let current;
+    try {
+      const currentRes = await apiFetch(env.server, "/api/preferences/models");
+      if (!currentRes?.ok || !currentRes.body?.models) {
+        return jsonErr("读不到当前模型配置，暂时没敢覆盖", 502);
+      }
+      current = currentRes.body.models;
+    } catch (err) {
+      return jsonErr("读当前模型配置失败：" + (err?.message || String(err)), 502);
+    }
+
+    const plan = buildManualRestorePlan(fw, current);
     let restored = false;
-    if (fw.degraded && Object.keys(patch.models || {}).length > 0) {
-      const env = initEnv(ctx);
-      if (!env.error) {
-        try {
-          const res = await apiFetch(env.server, "/api/preferences/models", {
-            method: "PUT",
-            body: JSON.stringify(patch),
-          });
-          restored = res.ok;
-          if (!res.ok) return jsonErr("恢复失败（HTTP " + res.status + "）", 502);
-        } catch (err) {
-          return jsonErr("恢复失败：" + (err?.message || String(err)), 502);
-        }
+    if (Object.keys(plan.patch.models || {}).length > 0) {
+      try {
+        const res = await apiFetch(env.server, "/api/preferences/models", {
+          method: "PUT",
+          body: JSON.stringify(plan.patch),
+        });
+        restored = !!res?.ok;
+        if (!res?.ok) return jsonErr("恢复失败（HTTP " + res.status + "）", 502);
+      } catch (err) {
+        return jsonErr("恢复失败：" + (err?.message || String(err)), 502);
       }
     }
-    fw.degraded = false;
-    fw.degradedAt = null;
-    fw.consecutiveFailures = 0;
-    fw.lastFailureAt = null;
-    delete fw.snapshot; // 恢复成功后清掉快照
-    fw.events = Array.isArray(fw.events) ? fw.events : [];
-    if (restored) {
-      fw.events.push({ type: "manual-restore", at: new Date().toISOString() });
-      if (fw.events.length > 50) fw.events = fw.events.slice(-50);
+
+    const nextFw = finalizeManualRestoreState(fw, plan);
+    nextFw.events = Array.isArray(nextFw.events) ? nextFw.events : [];
+    if (plan.trackedSlots.length > 0) {
+      nextFw.events.push({
+        type: "manual-restore",
+        slots: plan.restoredSlots,
+        skippedSlots: plan.skippedSlots,
+        labels: plan.restoredSlots.map((key) => FAILWATCH_SLOT_LABELS[key]),
+        at: new Date().toISOString(),
+      });
+      if (nextFw.events.length > 50) nextFw.events = nextFw.events.slice(-50);
     }
-    store.failwatch = fw;
+    store.failwatch = nextFw;
     writeStore(ctx.dataDir, store);
-    return json({ ok: true, restored });
+    return json({
+      ok: true,
+      restored,
+      restoredSlots: plan.restoredSlots,
+      skippedSlots: plan.skippedSlots,
+      message: plan.skippedSlots.length > 0
+        ? "有槽位已经被手动改过，已跳过，没覆盖你的选择"
+        : (restored ? "已切回主模型" : "当前没在使用备用模型，不用恢复"),
+    });
   });
 
   // ── 页面 ──
@@ -411,6 +460,28 @@ export default function registerPluginUiRoutes(app, ctx) {
     const inUseProvider = modelState?.activeModel?.provider || modelState?.current?.provider || null;
     if (inUseProvider === name) {
       return jsonErr("这家正在用着呢，先切到别家再收起来吧", 409);
+    }
+
+    // 备用模型也属于“正在使用”：收起它的供应商会让自动切换失去落点。
+    // 同时保护当前 utility / utility_large / vision，避免 Hana 配置仍依赖它却被隐藏。
+    const normalizeRef = (value) => {
+      if (value && typeof value === "object" && value.provider && value.id) return `${value.provider}/${value.id}`;
+      return typeof value === "string" ? value : "";
+    };
+    let currentSlots = {};
+    try {
+      const prefs = JSON.parse(fs.readFileSync(path.join(env.hanakoHome, "user", "preferences.json"), "utf-8"));
+      currentSlots = {
+        utility: normalizeRef(prefs.utility_model),
+        utility_large: normalizeRef(prefs.utility_large_model),
+        vision: normalizeRef(prefs.vision_model),
+      };
+    } catch { /* 读不到时保留已有 activeModel 保护 */ }
+    const protectedBy = listProtectedProviderSlots(currentSlots, store.failwatch?.backup || {});
+    const holders = protectedBy[name] || [];
+    if (holders.length > 0) {
+      const holderText = holders.map((item) => `${item.kind}「${item.label}」`).join("、");
+      return jsonErr(`这家还被${holderText}占用，先换掉相关模型再收起来吧`, 409);
     }
 
     const snapshot = snapshotProvider(provider);
