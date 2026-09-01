@@ -44,6 +44,7 @@ function makeFreshGuard(overrides = {}) {
     dataDir: () => "/tmp/data",
     backup: store.failwatch.backup,
     getBackupThinkingLevel: async () => "max",
+    getMainThinkingLevel: async () => null, // 默认保守不兼容
     ...overrides,
   };
   const guard = new FailwatchGuard(deps);
@@ -302,4 +303,32 @@ test("recovered 恢复行不算失败（排除误报）", async () => {
   assert.equal(r.action, "pending"); // 未到阈值
   const fw = getStore().failwatch;
   assert.equal(fw.consecutiveFailures, 1); // 只累计 1
+});
+
+test("主模型 thinking-capped：空响应 + 主模型深度思考 → 不降级，记 capped", async () => {
+  const { guard, getStore } = makeFreshGuard({
+    getMainThinkingLevel: async () => "max", // 主模型是深度思考型（如 command code）
+  });
+  const lines = [
+    "[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: 模型未回复正文，请检查思考内容或稍后重试。",
+    "[ERROR] [memory-ticker] 滚动摘要 (y.jsonl) 失败: 模型未回复正文，请检查思考内容或稍后重试。",
+  ];
+  const r = await guard.tick(lines); // 2 条空响应 + 主模型深度思考 → 全部归因 thinking-capped
+  assert.equal(r.action, "main-thinking-capped");
+  const fw = getStore().failwatch;
+  assert.ok(!fw.degraded, "不应进入降级态"); // 不降级
+  assert.equal(fw.thinkingCapped, 1); // 记了一次 capped
+  assert.equal(fw.consecutiveFailures ?? 0, 0); // 没累计失败
+});
+
+test("主模型非深度思考：空响应仍按真失败累计（不误赦免）", async () => {
+  const { guard, getStore } = makeFreshGuard({
+    getMainThinkingLevel: async () => "low", // 主模型非深度思考
+  });
+  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: 模型未回复正文，请检查思考内容或稍后重试。"];
+  await guard.tick(lines); // 第一次：累计 1
+  const r2 = await guard.tick(lines); // 第二次：触发降级
+  assert.equal(r2.action, "degraded");
+  const fw = getStore().failwatch;
+  assert.equal(fw.degraded, true);
 });
