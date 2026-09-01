@@ -12,6 +12,7 @@ import {
   decideStandbyFailure,
   buildDegradePatch,
   buildRestorePatch,
+  isStandbyConfig,
   summarizeUsage,
   isDeepThinkingModel,
   isThinkingCappedFailure,
@@ -238,6 +239,18 @@ test("恢复 patch 快照为 null → 清空（原本没配）", () => {
   const snapshot = { utility: null };
   const patch = buildRestorePatch({ models: { utility: "backup/x" } }, snapshot);
   assert.deepEqual(patch, { models: { utility: null } });
+});
+
+test("恢复 patch：降级没动过的槽位（vision）不写回，保持用户当前选择", () => {
+  // 识图不兜底（2026-09-01 产品决策）：降级只切 utility/utility_large，patch 里没有 vision。
+  // 即使快照里有 vision，恢复时也不该覆盖用户手动改过的 vision。
+  const snapshot = {
+    utility: { id: "gpt-5.6-luna", provider: "openai-codex" },
+    vision: { id: "mimo-v2.5", provider: "opencode-go" },
+  };
+  const patch = buildRestorePatch({ models: { utility: "command code/deepseek/deepseek-v4-flash" } }, snapshot);
+  assert.deepEqual(patch, { models: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } } });
+  assert.equal(patch.models.vision, undefined); // 不动 vision
 });
 
 // ── vision 失败 1 次阈值（2026-09-01 产品决策）──
@@ -490,4 +503,36 @@ test("isThinkingCappedFailure：非法入参返回 false", () => {
   assert.equal(isThinkingCappedFailure(null, "max"), false);
   assert.equal(isThinkingCappedFailure(undefined, "max"), false);
   assert.equal(isThinkingCappedFailure("empty", "max"), false);
+});
+
+// ── isStandbyConfig（手动接管检测）──
+
+test("isStandbyConfig：当前配置 == 备用配置 → true（没人动）", () => {
+  const current = { utility: { id: "deepseek-v4-flash", provider: "command code" } };
+  const patch = { models: { utility: "command code/deepseek/deepseek-v4-flash" } };
+  assert.equal(isStandbyConfig(current, patch), true);
+});
+
+test("isStandbyConfig：当前配置被手动改过 → false", () => {
+  const current = { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } };
+  const patch = { models: { utility: "command code/deepseek/deepseek-v4-flash" } };
+  assert.equal(isStandbyConfig(current, patch), false);
+});
+
+test("isStandbyConfig：patch 未覆盖的槽位不比较", () => {
+  const current = { utility: { id: "deepseek-v4-flash", provider: "command code" }, vision: { id: "mimo-v2.5", provider: "opencode-go" } };
+  const patch = { models: { utility: "command code/deepseek/deepseek-v4-flash" } }; // 只降级了 utility
+  assert.equal(isStandbyConfig(current, patch), true); // vision 不管
+});
+
+test("isStandbyConfig：字符串格式当前配置也兼容", () => {
+  const current = { utility: "command code/deepseek/deepseek-v4-flash" };
+  const patch = { models: { utility: "command code/deepseek/deepseek-v4-flash" } };
+  assert.equal(isStandbyConfig(current, patch), true);
+});
+
+test("isStandbyConfig：非法入参返回 false", () => {
+  assert.equal(isStandbyConfig(null, null), false);
+  assert.equal(isStandbyConfig({}, null), false);
+  assert.equal(isStandbyConfig(null, {}), false);
 });

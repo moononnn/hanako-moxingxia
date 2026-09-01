@@ -198,6 +198,69 @@ test("恢复时：写回快照原值（而不是清空）", async () => {
   assert.equal(fw.snapshot, undefined);
 });
 
+test("手动接管：降级态期间用户改了配置 → 恢复时不覆盖，退出降级", async () => {
+  const putBodies = [];
+  const { guard, getStore } = makeGuard({
+    readStore: () => ({
+      failwatch: {
+        backup: { utility: "command code/deepseek/deepseek-v4-flash" },
+        degraded: true,
+        degradedAt: Date.now() - 6 * 60 * 1000, // 坚持期满
+        lastDegradePatch: { models: { utility: "command code/deepseek/deepseek-v4-flash" } },
+        snapshot: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } },
+      },
+    }),
+    apiFetch: async (server, pathname, init) => {
+      if (init?.method === "PUT") {
+        putBodies.push(JSON.parse(init.body));
+        return { ok: true };
+      }
+      // 用户已经手动把 utility 改成别的模型（不是降级的备用，也不是快照原值）
+      return { ok: true, body: { models: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" }, vision: { id: "mimo-v2.5", provider: "opencode-go" } } } };
+    },
+  });
+
+  const r = await guard.maybeRestore();
+  assert.equal(r.action, "manual-takeover");
+  assert.equal(putBodies.length, 0); // 没写任何配置
+  const fw = getStore().failwatch;
+  assert.equal(fw.degraded, false); // 退出降级态
+  assert.equal(fw.manualTakenOver, true); // 标记手动接管
+  assert.equal(fw.snapshot, undefined); // 快照已清
+});
+
+test("手动接管：降级态期间用户改配置后又有失败 → 不再自动降级覆盖", async () => {
+  const putBodies = [];
+  const { guard, getStore } = makeFreshGuard({
+    readStore: () => ({
+      failwatch: {
+        backup: { utility: "command code/deepseek/deepseek-v4-flash" },
+        // 降级态残留 + 快照（上次降级存的）
+        degraded: true,
+        degradedAt: Date.now() - 10 * 1000,
+        snapshot: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } },
+        lastDegradePatch: { models: { utility: "command code/deepseek/deepseek-v4-flash" } },
+      },
+    }),
+    apiFetch: async (server, pathname, init) => {
+      if (init?.method === "PUT") {
+        putBodies.push(JSON.parse(init.body));
+        return { ok: true };
+      }
+      // 用户手动把 utility 改成了别的模型（既不是备用也不是快照原值）
+      return { ok: true, body: { models: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } } } };
+    },
+  });
+  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: Monthly usage limit reached."];
+
+  const r = await guard.tick(lines); // 失败 → 但用户已手动改配置 → 手动接管，不再降级
+  assert.equal(r.action, "manual-takeover");
+  assert.equal(putBodies.length, 0); // 没写任何配置
+  const fw = getStore().failwatch;
+  assert.equal(fw.degraded, false);
+  assert.equal(fw.manualTakenOver, true);
+});
+
 test("vision 失败 1 次 → guard 触发降级（vision 低频单次调用）", async () => {
   const { guard, getStore } = makeFreshGuard({
     apiFetch: async (server, pathname, init) => {
