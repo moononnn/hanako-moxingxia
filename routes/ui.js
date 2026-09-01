@@ -8,6 +8,7 @@ import path from "node:path";
 import {
   discoverServer,
   fetchCurrentModels,
+  fetchProviderModels,
   patchProviderConfig,
   readCatalog,
   readEffectiveCatalog,
@@ -15,6 +16,7 @@ import {
   resolveLocalProviderFile,
   triggerProviderRefresh,
   writeCatalogAtomic,
+  apiFetch,
 } from "../lib/host-api.js";
 import { resolveBuiltinProviderIds } from "../lib/builtin.js";
 import {
@@ -36,8 +38,10 @@ import {
   pruneHiddenRecords,
   readStore,
   setHiddenRecord,
+  writeStore,
 } from "../lib/store.js";
 import { renderPage } from "../lib/page.js";
+import { readUsageLedger, summarizeUsage, buildRestorePatch } from "../lib/failwatch.js";
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -91,6 +95,221 @@ function initEnv(ctx) {
 }
 
 export default function registerPluginUiRoutes(app, ctx) {
+  // ── 降级保护：读状态 + 消耗监测 ──
+  app.get("/api/failwatch/status", async (c) => {
+    const store = readStore(ctx.dataDir);
+    const fw = store.failwatch || {};
+
+    // 消耗量：读 usage-ledger.json，统计近 24h 的 utility / 插件子系统用量
+    let usage = null;
+    const env = initEnv(ctx);
+    if (env.hanakoHome) {
+      const ledgerPath = path.join(env.hanakoHome, "usage-ledger.json");
+      const ledger = readUsageLedger(ledgerPath);
+      if (ledger) {
+        const since = Date.now() - 24 * 60 * 60 * 1000;
+        usage = {
+          utility24h: summarizeUsage(ledger, { sinceMs: since, subsystem: "utility" }),
+          plugin24h: summarizeUsage(ledger, { sinceMs: since, subsystem: "plugin" }),
+          total24h: summarizeUsage(ledger, { sinceMs: since }),
+        };
+      }
+    }
+
+    // 降级事件日志（最近 20 条）
+    const events = Array.isArray(fw.events) ? fw.events.slice(-20) : [];
+
+    return json({
+      ok: true,
+      enabled: !!fw.backup,
+      backup: fw.backup || null,
+      degraded: !!fw.degraded,
+      degradedAt: fw.degradedAt || null,
+      consecutiveFailures: fw.consecutiveFailures || 0,
+      lastFailureAt: fw.lastFailureAt || null,
+      lastDegradePatch: fw.lastDegradePatch || null,
+      thinkingCapped: fw.thinkingCapped || 0,
+      lastThinkingCappedAt: fw.lastThinkingCappedAt || null,
+      events,
+      usage,
+    });
+  });
+
+  // ── 降级保护：拉 Hana 内置模型列表（供下拉选择备用模型） ──
+  app.get("/api/failwatch/models", async (c) => {
+    const env = initEnv(ctx);
+    if (env.error) return json({ ok: false, error: env.error });
+    const modelState = await fetchCurrentModels(env.server).catch(() => null);
+    if (!modelState) return json({ ok: false, error: "读不到模型列表" });
+    const models = (modelState.models || [])
+      .filter((m) => m && typeof m.id === "string" && m.id)
+      .map((m) => ({
+        id: m.id,
+        provider: typeof m.provider === "string" ? m.provider : "",
+        name: typeof m.name === "string" && m.name ? m.name : m.id,
+        ref: [m.provider, m.id].filter(Boolean).join("/"),
+        // 识图能力：input 数组含 image 即为能看图
+        vision: Array.isArray(m.input) && m.input.includes("image"),
+      }))
+      .sort((a, b) => a.provider.localeCompare(b.provider) || a.name.localeCompare(b.name));
+    // 当前 Hana 的工具/大工具/视觉/主模型配置（冲突检测基准）
+    const prefsPath = path.join(env.hanakoHome, "user", "preferences.json");
+    let current = null;
+    try {
+      const prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8"));
+      const norm = (v) => (v && typeof v === "object" && v.provider && v.id)
+        ? v.provider + "/" + v.id
+        : (typeof v === "string" && v ? v : "");
+      current = {
+        utility: norm(prefs.utility_model),
+        utility_large: norm(prefs.utility_large_model),
+        vision: norm(prefs.vision_model),
+      };
+    } catch {
+      current = null;
+    }
+    return json({ ok: true, models, current });
+  });
+
+  // ── 降级保护：测试备用模型连通性 ──
+  // 原理：从 provider-catalog.json 读到该 provider 的 api/base_url/api_key，
+  // 发一条最小请求验证模型存在且凭据有效。不保存任何东西。
+  app.post("/api/failwatch/test", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const ref = body?.ref;
+    if (typeof ref !== "string" || !ref.trim()) return jsonErr("缺模型引用");
+    const env = initEnv(ctx);
+    if (env.error) return json({ ok: false, error: env.error });
+
+    const [provider, ...rest] = ref.split("/");
+    const modelId = rest.join("/");
+    const catalog = readEffectiveCatalog(env.hanakoHome);
+    const p = catalog?.providers?.[provider];
+    if (!p) return json({ ok: false, error: "找不到这家供应商的配置" });
+    if (!p.base_url) return json({ ok: false, error: "这家供应商是 OAuth 登录型，没有可直接测试的接口地址（如 openai-codex），建议选其他备用模型" });
+    if (!p.api_key) return json({ ok: false, error: "这家供应商没配 api_key" });
+
+    const api = p.api || "openai-completions";
+    // 组最小请求体：不同协议端点不同
+    let url, payload;
+    const timeout = AbortSignal.timeout(15000);
+    try {
+      if (api === "anthropic-messages") {
+        url = p.base_url.replace(/\/$/, "") + "/v1/messages";
+        payload = { model: modelId, max_tokens: 1, messages: [{ role: "user", content: "hi" }] };
+      } else if (api === "openai-responses") {
+        url = p.base_url.replace(/\/$/, "") + "/responses";
+        payload = { model: modelId, input: "hi", max_output_tokens: 1 };
+      } else if (api === "google-generative-ai") {
+        url = `${p.base_url.replace(/\/$/, "")}/models/${encodeURIComponent(modelId)}:generateContent?key=${encodeURIComponent(p.api_key)}`;
+        payload = { contents: [{ parts: [{ text: "hi" }] }] };
+      } else {
+        url = p.base_url.replace(/\/$/, "") + "/chat/completions";
+        payload = { model: modelId, max_tokens: 1, messages: [{ role: "user", content: "hi" }] };
+      }
+      const headers = { "Content-Type": "application/json" };
+      if (api !== "google-generative-ai") headers.Authorization = `Bearer ${p.api_key}`;
+      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload), signal: timeout });
+      if (res.ok) return json({ ok: true, provider, model: modelId, status: res.status });
+      // 429 限流 / 401 认证 / 404 模型不存在，给友好提示
+      let reason = `HTTP ${res.status}`;
+      if (res.status === 401 || res.status === 403) reason = "认证失败，检查 key";
+      else if (res.status === 404) reason = "模型不存在或协议不对";
+      else if (res.status === 429) reason = "限流了";
+      return json({ ok: false, error: reason });
+    } catch (err) {
+      return json({ ok: false, error: "连接失败：" + (err?.message || String(err)) });
+    }
+  });
+
+  // ── 降级保护：保存备用模型配置（带冲突检测） ──
+  app.post("/api/failwatch/backup", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object") return jsonErr("参数不对");
+    const clean = {};
+    for (const key of ["utility", "utility_large", "vision"]) {
+      const v = body[key];
+      if (typeof v === "string" && v.trim()) clean[key] = v.trim();
+    }
+    if (Object.keys(clean).length === 0) return jsonErr("至少选一个备用模型");
+
+    // 冲突检测：备用模型不能跟当前 Hana 配置一样（一样则降级等于白切）
+    const env = initEnv(ctx);
+    let conflicts = [];
+    if (!env.error) {
+      const prefsPath = path.join(env.hanakoHome, "user", "preferences.json");
+      try {
+        const prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8"));
+        const norm = (v) => (v && typeof v === "object" && v.provider && v.id)
+          ? v.provider + "/" + v.id
+          : (typeof v === "string" && v ? v : "");
+        const cur = {
+          utility: norm(prefs.utility_model),
+          utility_large: norm(prefs.utility_large_model),
+          vision: norm(prefs.vision_model),
+        };
+        // 备用槽位 vs 当前同槽位：
+        const label = { utility: "小工具模型", utility_large: "大工具模型", vision: "视觉模型" };
+        for (const key of ["utility", "utility_large", "vision"]) {
+          if (clean[key] && cur[key] && clean[key] === cur[key]) {
+            conflicts.push(label[key] + " 的备用模型跟当前配置一样（" + clean[key] + "），降级了也还是同一个，换个吧");
+          }
+        }
+      } catch { /* 读不到配置就不做冲突检测 */ }
+    }
+    if (conflicts.length > 0) {
+      return json({ ok: false, error: conflicts.join("；") });
+    }
+
+    const store = readStore(ctx.dataDir);
+    const fw = store.failwatch || {};
+    // 保存备用配置；若当前处于降级态，同时把 lastDegradePatch 更新（恢复时用新配置）
+    fw.backup = clean;
+    if (fw.degraded) fw.lastDegradePatch = clean;
+    fw.events = Array.isArray(fw.events) ? fw.events : [];
+    store.failwatch = fw;
+    writeStore(ctx.dataDir, store);
+    return json({ ok: true, backup: clean });
+  });
+
+  // ── 降级保护：手动重置降级状态（切回主模型） ──
+  app.post("/api/failwatch/reset", async (c) => {
+    const store = readStore(ctx.dataDir);
+    const fw = store.failwatch || {};
+    // 快照-恢复制：优先写回降级前快照；没快照时退化旧行为（清空回退 chat）
+    const patch = buildRestorePatch(fw.lastDegradePatch || fw.backup, fw.snapshot || null);
+    // 只有降级态才有东西可恢复
+    let restored = false;
+    if (fw.degraded && Object.keys(patch.models || {}).length > 0) {
+      const env = initEnv(ctx);
+      if (!env.error) {
+        try {
+          const res = await apiFetch(env.server, "/api/preferences/models", {
+            method: "PUT",
+            body: JSON.stringify(patch),
+          });
+          restored = res.ok;
+          if (!res.ok) return jsonErr("恢复失败（HTTP " + res.status + "）", 502);
+        } catch (err) {
+          return jsonErr("恢复失败：" + (err?.message || String(err)), 502);
+        }
+      }
+    }
+    fw.degraded = false;
+    fw.degradedAt = null;
+    fw.consecutiveFailures = 0;
+    fw.lastFailureAt = null;
+    delete fw.snapshot; // 恢复成功后清掉快照
+    fw.events = Array.isArray(fw.events) ? fw.events : [];
+    if (restored) {
+      fw.events.push({ type: "manual-restore", at: new Date().toISOString() });
+      if (fw.events.length > 50) fw.events = fw.events.slice(-50);
+    }
+    store.failwatch = fw;
+    writeStore(ctx.dataDir, store);
+    return json({ ok: true, restored });
+  });
+
   // ── 页面 ──
   app.get("/settings", (c) => {
     const env = initEnv(ctx);
@@ -195,6 +414,14 @@ export default function registerPluginUiRoutes(app, ctx) {
     }
 
     const snapshot = snapshotProvider(provider);
+    // 快照模型为空但供应商实际有模型时（catalog 滞后 / 本地定义未合并），
+    // 从 Hana 运行时模型列表补齐，避免 show 时恢复不了模型列表
+    if (snapshot.models.length === 0) {
+      const runtimeModels = (modelState?.models || [])
+        .filter((m) => m?.provider === name && typeof m.id === "string")
+        .map((m) => ({ id: m.id, name: m.name || m.id }));
+      if (runtimeModels.length > 0) snapshot.models = runtimeModels;
+    }
     const patch = buildHidePatch(provider);
     // 先落快照再调 API：API 失败时回滚快照，保证数据与配置永远一致
     setHiddenRecord(ctx.dataDir, store, name, { ...snapshot, hiddenAt: new Date().toISOString() });
@@ -227,14 +454,51 @@ export default function registerPluginUiRoutes(app, ctx) {
       dropHiddenRecord(ctx.dataDir, store, name);
       return json({ ok: true, error: "这家供应商已经不在配置里了，记录已清理" });
     }
-    const patch = buildShowPatch(provider, snapshot);
+
+    // 快照模型为空或丢失时（原快照本就没存上 / 用户中途在设置页重新发现过模型），
+    // 不能把空数组写回去——那等于保持隐藏态。分两档恢复：
+    //   1. 自定义供应商（含类型未知，宁可用 fetch 兜底）：调 fetch-models 重新发现真实模型列表后写回
+    //   2. 内置供应商：带 seed_default_models 让 Hana 填默认模型
+    const builtinIds = resolveBuiltinProviderIds(env.hanakoHome);
+    const kind = resolveProviderKind(name, provider, builtinIds);
+    const isBuiltin = kind === "builtin";
+    let restoreModels = Array.isArray(snapshot?.models) ? snapshot.models : [];
+    let fetchError = null;
+    if (restoreModels.length === 0 && !isBuiltin) {
+      try {
+        const fetched = await fetchProviderModels(env.server, name);
+        if (fetched.models.length > 0) restoreModels = fetched.models;
+        else fetchError = fetched.error || "重新发现模型返回空列表";
+      } catch (err) {
+        fetchError = err.message;
+      }
+    }
+
+    const patch = buildShowPatch(provider, { ...snapshot, models: restoreModels }, {
+      // 内置供应商一定 seed；自定义供应商 fetch 失败时也带 seed 试一次（可能有默认条目）
+      seedDefault: isBuiltin || (restoreModels.length === 0 && fetchError !== null),
+    });
     try {
       await patchProviderConfig(env.server, name, patch);
     } catch (err) {
       return jsonErr(err.message, 502);
     }
     dropHiddenRecord(ctx.dataDir, store, name);
-    return json({ ok: true });
+
+    // 恢复后对账：确认模型真的回到 Hana 运行时，没回到给明确警告
+    let warning = null;
+    if (fetchError) {
+      warning = `模型列表没能自动找回（${fetchError}），需要去 Hana 设置页重新「发现模型」一次`;
+    } else {
+      const modelState = await fetchCurrentModels(env.server).catch(() => null);
+      const runtimeIds = (modelState?.models || [])
+        .filter((m) => m?.provider === name && typeof m.id === "string")
+        .map((m) => m.id);
+      if (runtimeIds.length === 0) {
+        warning = "供应商已打开，但模型菜单里暂时没看到它的模型——去 Hana 设置页重新「发现模型」即可";
+      }
+    }
+    return json({ ok: true, ...(warning ? { warning } : {}) });
   });
 
   // ── 模型排序 ──
