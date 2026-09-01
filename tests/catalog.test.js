@@ -16,6 +16,7 @@ import {
   reorderModelEntries,
   reorderProvidersObject,
   resolveProviderKind,
+  snapshotHasModels,
   snapshotProvider,
   validateReorder,
 } from "../lib/catalog.js";
@@ -82,6 +83,38 @@ test("buildShowPatch：快照无 projection 时写 null（回退插件默认）"
   const snap = { models: ["m1"], projection: null };
   const patch = buildShowPatch(p, snap);
   assert.equal(patch.capabilities.chat.projection, null);
+});
+
+test("buildShowPatch：快照模型为空 + seedDefault 时带 seed_default_models", () => {
+  const p = { models: [] };
+  const snap = { models: [], projection: null };
+  const patch = buildShowPatch(p, snap, { seedDefault: true });
+  assert.deepEqual(patch.models, []);
+  assert.equal(patch.seed_default_models, true);
+});
+
+test("buildShowPatch：快照模型非空时不带 seed 标志", () => {
+  const p = { models: [] };
+  const snap = { models: ["m1"], projection: null };
+  const patch = buildShowPatch(p, snap, { seedDefault: true });
+  assert.deepEqual(patch.models, ["m1"]);
+  assert.equal("seed_default_models" in patch, false);
+});
+
+test("buildShowPatch：默认（不带 seed）行为与旧版一致", () => {
+  const p = { models: [], capabilities: { chat: { projection: "none" } } };
+  const snap = { models: ["m1", "m2"], projection: "sdk-auth-alias" };
+  const patch = buildShowPatch(p, snap);
+  assert.deepEqual(patch.models, ["m1", "m2"]);
+  assert.equal(patch.capabilities.chat.projection, "sdk-auth-alias");
+  assert.equal("seed_default_models" in patch, false);
+});
+
+test("snapshotHasModels：区分空快照与有模型快照", () => {
+  assert.equal(snapshotHasModels({ models: ["a"] }), true);
+  assert.equal(snapshotHasModels({ models: [] }), false);
+  assert.equal(snapshotHasModels({}), false);
+  assert.equal(snapshotHasModels(null), false);
 });
 
 // ── validateReorder ──
