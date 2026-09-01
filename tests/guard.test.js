@@ -5,330 +5,282 @@ import assert from "node:assert/strict";
 
 import { FailwatchGuard } from "../lib/failwatch-guard.js";
 
-function makeGuard(overrides = {}) {
+const MAIN = {
+  utility: { provider: "main", id: "utility-main" },
+  utility_large: { provider: "main", id: "large-main" },
+  vision: { provider: "main", id: "vision-main" },
+};
+const BACKUP = {
+  utility: "backup/utility-standby",
+  utility_large: "backup/large-standby",
+  vision: "backup/vision-standby",
+};
+
+function makeGuard({
+  backup = BACKUP,
+  current = MAIN,
+  initialFailwatch = {},
+  emptyFailwatch = false,
+  mainLevels = {},
+  backupLevels = {},
+  sendNotify = true,
+  putResult,
+} = {}) {
   let store = {
-    failwatch: {
-      backup: { utility: "command code/deepseek/deepseek-v4-flash" },
+    failwatch: emptyFailwatch ? null : {
+      backup: { ...backup },
+      ...initialFailwatch,
+    },
+  };
+  const currentModels = structuredClone(current);
+  const putBodies = [];
+  const notifications = [];
+  const apiCalls = [];
+
+  const deps = {
+    readLogLines: () => [],
+    discoverServer: () => ({ port: 1, token: "x" }),
+    apiFetch: async (server, pathname, init) => {
+      apiCalls.push({ pathname, init });
+      if (init?.method === "PUT") {
+        const patch = JSON.parse(init.body);
+        putBodies.push(patch);
+        if (putResult) return putResult(patch);
+        Object.assign(currentModels, patch.models || {});
+        return { ok: true, status: 200 };
+      }
+      return { ok: true, body: { models: structuredClone(currentModels) } };
+    },
+    readStore: () => store,
+    writeStore: (_, next) => { store = next; },
+    dataDir: () => "/tmp/moxingxia-test",
+    backup,
+    policy: { threshold: 2, visionThreshold: 1, standbyThreshold: 2 },
+    getMainThinkingLevel: async (slot) => mainLevels[slot] || null,
+    getBackupThinkingLevel: async (_, slot) => backupLevels[slot] || null,
+    sendNotify: sendNotify ? async (info) => { notifications.push(info); } : undefined,
+  };
+  const guard = new FailwatchGuard(deps);
+  return {
+    guard,
+    getStore: () => store,
+    currentModels,
+    putBodies,
+    notifications,
+    apiCalls,
+  };
+}
+
+const utilityTimeout = "[ERROR] [llm-utils] summarizeTitle failed: LLM_TIMEOUT utility";
+const largeTimeout = "[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: LLM_TIMEOUT";
+const visionFailure = "[WARN] [session] vision context injection diagnostic: {\"code\":\"VISION_CONTEXT_INJECTION_FAILED\"}";
+
+// ── 切换触发 ──
+
+test("明确认证故障一次就切换小工具备用模型，并弹提个醒通知", async () => {
+  const { guard, getStore, currentModels, putBodies, notifications } = makeGuard();
+  const r = await guard.tick(["[ERROR] [llm] LLM_AUTH_FAILED utility"]);
+
+  assert.equal(r.action, "switched-to-backup");
+  assert.equal(r.slot, "utility");
+  assert.equal(currentModels.utility, BACKUP.utility);
+  assert.deepEqual(putBodies, [{ models: { utility: BACKUP.utility } }]);
+  assert.equal(notifications.length, 1);
+  assert.match(notifications[0].title, /小工具模型/);
+  assert.match(notifications[0].message, /认证或密钥失败/);
+  assert.match(notifications[0].message, /backup\/utility-standby/);
+  assert.equal(getStore().failwatch.slots.utility.mode, "backup");
+});
+
+test("临时超时第一次只累计，第二次才切换", async () => {
+  const { guard, getStore, currentModels, putBodies } = makeGuard();
+  const r1 = await guard.tick([utilityTimeout]);
+  assert.equal(r1.action, "pending");
+  assert.equal(getStore().failwatch.slots.utility.consecutiveFailures, 1);
+  assert.equal(putBodies.length, 0);
+
+  const r2 = await guard.tick([utilityTimeout]);
+  assert.equal(r2.action, "switched-to-backup");
+  assert.equal(currentModels.utility, BACKUP.utility);
+  assert.equal(putBodies.length, 1);
+});
+
+test("识图失败一次就切识图备用模型，且只写 vision 槽", async () => {
+  const { guard, getStore, currentModels, putBodies, notifications } = makeGuard();
+  const r = await guard.tick([visionFailure]);
+
+  assert.equal(r.action, "switched-to-backup");
+  assert.equal(r.slot, "vision");
+  assert.equal(currentModels.vision, BACKUP.vision);
+  assert.deepEqual(putBodies, [{ models: { vision: BACKUP.vision } }]);
+  assert.equal(getStore().failwatch.slots.utility.mode, "primary");
+  assert.match(notifications[0].title, /识图模型/);
+});
+
+test("两个槽位可在同一轮独立切换，patch 不互相覆盖", async () => {
+  const { guard, getStore, currentModels, putBodies } = makeGuard();
+  const r = await guard.tick([
+    "[ERROR] [llm] LLM_AUTH_FAILED utility",
+    visionFailure,
+  ]);
+
+  assert.equal(r.action, "batch-switched");
+  assert.equal(currentModels.utility, BACKUP.utility);
+  assert.equal(currentModels.vision, BACKUP.vision);
+  assert.equal(putBodies.length, 2);
+  assert.deepEqual(putBodies.map((x) => x.models), [
+    { utility: BACKUP.utility },
+    { vision: BACKUP.vision },
+  ]);
+  assert.equal(getStore().failwatch.slots.utility.mode, "backup");
+  assert.equal(getStore().failwatch.slots.vision.mode, "backup");
+});
+
+test("小工具和大工具分别计数、分别切换", async () => {
+  const { guard, getStore, currentModels, putBodies } = makeGuard();
+
+  const first = await guard.tick([utilityTimeout, largeTimeout]);
+  assert.equal(first.action, "batch-processed");
+  assert.equal(getStore().failwatch.slots.utility.consecutiveFailures, 1);
+  assert.equal(getStore().failwatch.slots.utility_large.consecutiveFailures, 1);
+  assert.equal(putBodies.length, 0);
+
+  const second = await guard.tick([utilityTimeout]);
+  assert.equal(second.action, "switched-to-backup");
+  assert.equal(currentModels.utility, BACKUP.utility);
+  assert.equal(currentModels.utility_large.provider, "main");
+  assert.deepEqual(putBodies, [{ models: { utility: BACKUP.utility } }]);
+});
+
+test("同一轮多条同槽位失败只切一次，不把剩余旧日志当成备用失败", async () => {
+  const { guard, getStore, putBodies } = makeGuard();
+  const r = await guard.tick([utilityTimeout, utilityTimeout, utilityTimeout]);
+
+  assert.equal(r.action, "switched-to-backup");
+  assert.equal(putBodies.length, 1);
+  assert.equal(getStore().failwatch.slots.utility.mode, "backup");
+  assert.equal(getStore().failwatch.slots.utility.standbyFailures || 0, 0);
+});
+
+// ── 手动恢复与接管 ──
+
+test("切换后保持备用，maybeRestore 不会自动切回", async () => {
+  const { guard, currentModels, putBodies } = makeGuard();
+  await guard.tick(["[ERROR] [llm] LLM_AUTH_FAILED utility"]);
+  const before = putBodies.length;
+
+  const result = await guard.maybeRestore();
+  assert.deepEqual(result, { action: "manual-only", reason: "manual-restore-required" });
+  assert.equal(putBodies.length, before);
+  assert.equal(currentModels.utility, BACKUP.utility);
+});
+
+test("切换后用户手动改了槽位，后续失败不再覆盖", async () => {
+  const { guard, getStore, currentModels, putBodies } = makeGuard();
+  await guard.tick(["[ERROR] [llm] LLM_AUTH_FAILED utility"]);
+  currentModels.utility = { provider: "user-choice", id: "user-picked" };
+  const before = putBodies.length;
+
+  const r = await guard.tick([utilityTimeout]);
+  assert.equal(r.action, "manual-takeover");
+  assert.equal(putBodies.length, before);
+  assert.equal(getStore().failwatch.slots.utility.mode, "manual");
+  assert.equal(currentModels.utility.id, "user-picked");
+});
+
+test("手动切回时仍保持备用的槽位才允许恢复，其他槽位跳过", () => {
+  // 纯函数计划的行为在 failwatch.test.js 覆盖；这里确认守护不会自行调用恢复。
+  const { guard } = makeGuard();
+  return guard.maybeRestore().then((r) => assert.equal(r.action, "manual-only"));
+});
+
+// ── 备用模型自身故障 ──
+
+test("备用模型连续失败后进入 backup-failed，仍保持备用等待用户处理", async () => {
+  const { guard, getStore, currentModels, putBodies } = makeGuard();
+  await guard.tick(["[ERROR] [llm] LLM_AUTH_FAILED utility"]);
+  assert.equal(currentModels.utility, BACKUP.utility);
+
+  const r1 = await guard.tick([utilityTimeout]);
+  const r2 = await guard.tick([utilityTimeout]);
+  assert.equal(r1.action, "standby-failing");
+  assert.equal(r2.action, "backup-failed");
+  assert.equal(getStore().failwatch.slots.utility.mode, "backup-failed");
+  assert.equal(getStore().failwatch.degraded, true);
+  assert.equal(currentModels.utility, BACKUP.utility);
+  assert.equal(putBodies.length, 1);
+});
+
+test("备用模型空响应若只是深度思考耗尽，不累计备用故障", async () => {
+  const { guard, getStore, currentModels } = makeGuard({ backupLevels: { utility: "max" } });
+  await guard.tick(["[ERROR] [llm] LLM_AUTH_FAILED utility"]);
+
+  const r = await guard.tick(["[ERROR] [llm] LLM_EMPTY_RESPONSE utility"]);
+  assert.equal(r.action, "standby-thinking-capped");
+  assert.equal(getStore().failwatch.slots.utility.standbyFailures || 0, 0);
+  assert.equal(getStore().failwatch.slots.utility.mode, "backup");
+  assert.equal(currentModels.utility, BACKUP.utility);
+});
+
+// ── 归因与 fail-open ──
+
+test("主模型深度思考导致空响应时不切备用", async () => {
+  const { guard, getStore, currentModels, putBodies } = makeGuard({ mainLevels: { utility_large: "max" } });
+  const lines = [
+    "[ERROR] [memory-ticker] 滚动摘要 (a.jsonl) 失败: 模型未回复正文",
+    "[ERROR] [memory-ticker] 滚动摘要 (b.jsonl) 失败: 模型未回复正文",
+  ];
+  const r = await guard.tick(lines);
+
+  assert.equal(r.action, "main-thinking-capped");
+  assert.equal(putBodies.length, 0);
+  assert.equal(currentModels.utility_large.provider, "main");
+  assert.equal(getStore().failwatch.slots.utility_large.thinkingCapped, 2);
+});
+
+test("没有配置备用模型时只记录切换失败，不改变主模型", async () => {
+  const { guard, getStore, currentModels, putBodies } = makeGuard({ backup: {} });
+  const r = await guard.tick(["[ERROR] [llm] LLM_AUTH_FAILED utility"]);
+
+  assert.equal(r.action, "switch-failed");
+  assert.equal(r.error, "no-backup-configured");
+  assert.equal(putBodies.length, 0);
+  assert.equal(currentModels.utility.provider, "main");
+  assert.equal(getStore().failwatch.degraded, false);
+});
+
+test("首次运行时 failwatch 为空也会建立可持久化的三槽状态", async () => {
+  const { guard, getStore, putBodies } = makeGuard({ backup: {}, emptyFailwatch: true });
+  const r = await guard.tick(["[ERROR] [llm] LLM_AUTH_FAILED utility"]);
+
+  assert.equal(r.action, "switch-failed");
+  assert.equal(putBodies.length, 0);
+  assert.ok(getStore().failwatch);
+  assert.equal(getStore().failwatch.slots.utility.mode, "primary");
+});
+
+test("旧版单一 degraded 状态能迁移成当前槽位的备用状态", async () => {
+  const { guard, getStore, currentModels } = makeGuard({
+    initialFailwatch: {
       degraded: true,
       degradedAt: Date.now() - 1000,
+      lastDegradePatch: { models: { utility: BACKUP.utility } },
+      snapshot: { utility: MAIN.utility },
     },
-  };
-  const deps = {
-    readLogLines: () => [],
-    discoverServer: () => ({ port: 1, token: "x" }),
-    apiFetch: async () => ({ ok: true }),
-    readStore: () => store,
-    writeStore: (_, s) => { store = s; },
-    dataDir: () => "/tmp/data",
-    backup: store.failwatch.backup,
-    getBackupThinkingLevel: async () => "max",
-    ...overrides,
-  };
-  const guard = new FailwatchGuard(deps);
-  return { guard, getStore: () => store };
-}
-
-/** 模拟降级前的状态：非降级态 + 有备用 */
-function makeFreshGuard(overrides = {}) {
-  let store = {
-    failwatch: {
-      backup: { utility: "command code/deepseek/deepseek-v4-flash" },
-    },
-  };
-  const deps = {
-    readLogLines: () => [],
-    discoverServer: () => ({ port: 1, token: "x" }),
-    apiFetch: async () => ({ ok: true }),
-    readStore: () => store,
-    writeStore: (_, s) => { store = s; },
-    dataDir: () => "/tmp/data",
-    backup: store.failwatch.backup,
-    getBackupThinkingLevel: async () => "max",
-    getMainThinkingLevel: async () => null, // 默认保守不兼容
-    ...overrides,
-  };
-  const guard = new FailwatchGuard(deps);
-  return { guard, getStore: () => store };
-}
-
-test("降级态 + empty 失败 + 深度思考备胎 → thinking-capped，不累计 standbyFailures", async () => {
-  const { guard, getStore } = makeGuard();
-  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: 模型未回复正文，请检查思考内容或稍后重试。"];
-
-  const r = await guard.tick(lines);
-  assert.equal(r.action, "standby-thinking-capped");
-  assert.equal(r.capped, true);
-
-  const fw = getStore().failwatch;
-  assert.equal(fw.thinkingCapped, 1);
-  assert.equal(fw.standbyFailures, undefined); // 没累计
-  assert.equal(fw.degraded, true); // 继续降级态
-});
-
-test("降级态 + quota 失败（真坏）→ 正常累计 standbyFailures", async () => {
-  const { guard, getStore } = makeGuard();
-  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: Monthly usage limit reached."];
-
-  const r = await guard.tick(lines);
-  assert.equal(r.action, "standby-degrading");
-  assert.equal(r.reason, "standby-pending");
-
-  const fw = getStore().failwatch;
-  assert.equal(fw.standbyFailures, 1); // 累计了
-  assert.equal(fw.thinkingCapped, undefined); // 没记 capped
-});
-
-test("降级态 + 连续两次真坏 → 停止降级", async () => {
-  const { guard, getStore } = makeGuard();
-  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: Monthly usage limit reached."];
-
-  await guard.tick(lines); // 第一次：standbyFailures=1
-  const r2 = await guard.tick(lines); // 第二次：触发停止
-  assert.equal(r2.action, "standby-failed-stop");
-  const fw = getStore().failwatch;
-  assert.equal(fw.standbyFailed, true);
-  assert.equal(fw.degraded, false);
-});
-
-test("备胎思考档位读不到 → 保守走原判定（empty 也累计）", async () => {
-  const { guard, getStore } = makeGuard({
-    getBackupThinkingLevel: async () => null,
+    current: { ...MAIN, utility: BACKUP.utility },
   });
-  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: 模型未回复正文，请检查思考内容或稍后重试。"];
+  const r = await guard.tick([utilityTimeout]);
 
-  const r = await guard.tick(lines);
-  assert.equal(r.action, "standby-degrading"); // 走原 standby 逻辑
-  const fw = getStore().failwatch;
-  assert.equal(fw.standbyFailures, 1);
+  assert.equal(r.action, "standby-failing");
+  assert.equal(getStore().failwatch.slots.utility.mode, "backup");
+  assert.equal(currentModels.utility, BACKUP.utility);
 });
 
-// ── 快照-恢复制（2026-09-01 产品决策）──
+test("未安装提个醒时切换仍然完成，不阻断主流程", async () => {
+  const { guard, currentModels, notifications } = makeGuard({ sendNotify: false });
+  const r = await guard.tick(["[ERROR] [llm] LLM_AUTH_FAILED utility"]);
 
-test("降级触发时：读当前配置存快照 + 写备用模型", async () => {
-  const putBodies = [];
-  const { guard, getStore } = makeFreshGuard({
-    apiFetch: async (server, pathname, init) => {
-      if (init?.method === "PUT") {
-        putBodies.push(JSON.parse(init.body));
-        return { ok: true };
-      }
-      // GET /api/preferences/models → 返回当前配置
-      return {
-        ok: true,
-        body: {
-          models: {
-            utility: { id: "gpt-5.6-luna", provider: "openai-codex" },
-            vision: { id: "mimo-v2.5", provider: "opencode-go" },
-          },
-        },
-      };
-    },
-  });
-  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: Monthly usage limit reached."];
-
-  await guard.tick(lines); // 第一次：consecutiveFailures=1
-  const r = await guard.tick(lines); // 第二次：触发降级
-  assert.equal(r.action, "degraded");
-
-  const fw = getStore().failwatch;
-  // 快照存了用户原配置
-  assert.deepEqual(fw.snapshot, {
-    utility: { id: "gpt-5.6-luna", provider: "openai-codex" },
-    vision: { id: "mimo-v2.5", provider: "opencode-go" },
-  });
-  // 降级 patch 写备用
-  assert.deepEqual(putBodies[0], {
-    models: { utility: "command code/deepseek/deepseek-v4-flash" },
-  });
-});
-
-test("降级已触发过（有快照）→ 不重复快照覆盖", async () => {
-  const { guard, getStore } = makeGuard({
-    // 已有快照 + 已降级
-    readStore: () => ({
-      failwatch: {
-        backup: { utility: "command code/deepseek/deepseek-v4-flash" },
-        degraded: false,
-        snapshot: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } },
-      },
-    }),
-    apiFetch: async (server, pathname, init) => {
-      if (init?.method === "PUT") return { ok: true };
-      // 万一又读了，返回不同的值，验证不被覆盖
-      return { ok: true, body: { models: { utility: { id: "SOMETHING-ELSE", provider: "x" } } } };
-    },
-  });
-  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: Monthly usage limit reached."];
-
-  await guard.tick(lines); // 第一次：累计 1
-  await guard.tick(lines); // 第二次：触发降级
-  const fw = getStore().failwatch;
-  assert.deepEqual(fw.snapshot, { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } }); // 未被覆盖
-});
-
-test("恢复时：写回快照原值（而不是清空）", async () => {
-  const putBodies = [];
-  const { guard, getStore } = makeGuard({
-    readStore: () => ({
-      failwatch: {
-        backup: { utility: "command code/deepseek/deepseek-v4-flash" },
-        degraded: true,
-        degradedAt: Date.now() - 6 * 60 * 1000, // 坚持期满
-        lastDegradePatch: { models: { utility: "command code/deepseek/deepseek-v4-flash" } },
-        snapshot: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } },
-      },
-    }),
-    apiFetch: async (server, pathname, init) => {
-      if (init?.method === "PUT") {
-        putBodies.push(JSON.parse(init.body));
-        return { ok: true };
-      }
-      return { ok: true, body: { models: {} } };
-    },
-  });
-
-  const r = await guard.maybeRestore();
-  assert.equal(r.action, "restored");
-  // 写回快照原值，不是 null
-  assert.deepEqual(putBodies[0], {
-    models: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } },
-  });
-  // 恢复后快照被清掉
-  const fw = getStore().failwatch;
-  assert.equal(fw.degraded, false);
-  assert.equal(fw.snapshot, undefined);
-});
-
-test("手动接管：降级态期间用户改了配置 → 恢复时不覆盖，退出降级", async () => {
-  const putBodies = [];
-  const { guard, getStore } = makeGuard({
-    readStore: () => ({
-      failwatch: {
-        backup: { utility: "command code/deepseek/deepseek-v4-flash" },
-        degraded: true,
-        degradedAt: Date.now() - 6 * 60 * 1000, // 坚持期满
-        lastDegradePatch: { models: { utility: "command code/deepseek/deepseek-v4-flash" } },
-        snapshot: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } },
-      },
-    }),
-    apiFetch: async (server, pathname, init) => {
-      if (init?.method === "PUT") {
-        putBodies.push(JSON.parse(init.body));
-        return { ok: true };
-      }
-      // 用户已经手动把 utility 改成别的模型（不是降级的备用，也不是快照原值）
-      return { ok: true, body: { models: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" }, vision: { id: "mimo-v2.5", provider: "opencode-go" } } } };
-    },
-  });
-
-  const r = await guard.maybeRestore();
-  assert.equal(r.action, "manual-takeover");
-  assert.equal(putBodies.length, 0); // 没写任何配置
-  const fw = getStore().failwatch;
-  assert.equal(fw.degraded, false); // 退出降级态
-  assert.equal(fw.manualTakenOver, true); // 标记手动接管
-  assert.equal(fw.snapshot, undefined); // 快照已清
-});
-
-test("手动接管：降级态期间用户改配置后又有失败 → 不再自动降级覆盖", async () => {
-  const putBodies = [];
-  const { guard, getStore } = makeFreshGuard({
-    readStore: () => ({
-      failwatch: {
-        backup: { utility: "command code/deepseek/deepseek-v4-flash" },
-        // 降级态残留 + 快照（上次降级存的）
-        degraded: true,
-        degradedAt: Date.now() - 10 * 1000,
-        snapshot: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } },
-        lastDegradePatch: { models: { utility: "command code/deepseek/deepseek-v4-flash" } },
-      },
-    }),
-    apiFetch: async (server, pathname, init) => {
-      if (init?.method === "PUT") {
-        putBodies.push(JSON.parse(init.body));
-        return { ok: true };
-      }
-      // 用户手动把 utility 改成了别的模型（既不是备用也不是快照原值）
-      return { ok: true, body: { models: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" } } } };
-    },
-  });
-  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: Monthly usage limit reached."];
-
-  const r = await guard.tick(lines); // 失败 → 但用户已手动改配置 → 手动接管，不再降级
-  assert.equal(r.action, "manual-takeover");
-  assert.equal(putBodies.length, 0); // 没写任何配置
-  const fw = getStore().failwatch;
-  assert.equal(fw.degraded, false);
-  assert.equal(fw.manualTakenOver, true);
-});
-
-test("vision 失败 1 次 → guard 触发降级（vision 低频单次调用）", async () => {
-  const { guard, getStore } = makeFreshGuard({
-    apiFetch: async (server, pathname, init) => {
-      if (init?.method === "PUT") return { ok: true };
-      // GET /api/preferences/models → 返回当前配置（供快照）
-      return { ok: true, body: { models: { utility: { id: "gpt-5.6-luna", provider: "openai-codex" }, vision: { id: "mimo-v2.5", provider: "opencode-go" } } } };
-    },
-  });
-  const lines = ['[WARN] [session] vision context injection diagnostic: {"code":"VISION_CONTEXT_INJECTION_FAILED","message":"vision auxiliary model is required for image input with the current text-only model"}'];
-
-  const r = await guard.tick(lines); // 1 次 vision 失败就触发
-  assert.equal(r.action, "degraded");
-  assert.equal(r.reason, "vision-threshold");
-  const fw = getStore().failwatch;
-  assert.equal(fw.degraded, true);
-  assert.deepEqual(fw.snapshot, { utility: { id: "gpt-5.6-luna", provider: "openai-codex" }, vision: { id: "mimo-v2.5", provider: "opencode-go" } }); // 快照存了
-});
-
-test("多条失败一次 tick 逐条累计（3 条 → 一次触发降级，不卡 1 次）", async () => {
-  const { guard, getStore } = makeFreshGuard();
-  const lines = [
-    "[ERROR] [memory-ticker] 滚动摘要 (a.jsonl) 失败: Monthly usage limit reached.",
-    "[ERROR] [memory-ticker] 滚动摘要 (b.jsonl) 失败: Monthly usage limit reached.",
-    "[ERROR] [memory-ticker] 滚动摘要 (c.jsonl) 失败: Monthly usage limit reached.",
-  ];
-  const r = await guard.tick(lines); // 3 条 → 一次 tick 就累计 3 → 触发降级
-  assert.equal(r.action, "degraded");
-  const fw = getStore().failwatch;
-  assert.equal(fw.degraded, true);
-});
-
-test("recovered 恢复行不算失败（排除误报）", async () => {
-  const { guard, getStore } = makeFreshGuard();
-  const lines = [
-    "[INFO] [memory-ticker] 滚动摘要 恢复正常（之前: 滚动摘要 (x.jsonl)|Monthly usage limit reached）",
-    "[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: 模型未回复正文，请检查思考内容或稍后重试。",
-  ];
-  const r = await guard.tick(lines); // recovered 不算，只有 1 条真失败
-  assert.equal(r.action, "pending"); // 未到阈值
-  const fw = getStore().failwatch;
-  assert.equal(fw.consecutiveFailures, 1); // 只累计 1
-});
-
-test("主模型 thinking-capped：空响应 + 主模型深度思考 → 不降级，记 capped", async () => {
-  const { guard, getStore } = makeFreshGuard({
-    getMainThinkingLevel: async () => "max", // 主模型是深度思考型（如 command code）
-  });
-  const lines = [
-    "[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: 模型未回复正文，请检查思考内容或稍后重试。",
-    "[ERROR] [memory-ticker] 滚动摘要 (y.jsonl) 失败: 模型未回复正文，请检查思考内容或稍后重试。",
-  ];
-  const r = await guard.tick(lines); // 2 条空响应 + 主模型深度思考 → 全部归因 thinking-capped
-  assert.equal(r.action, "main-thinking-capped");
-  const fw = getStore().failwatch;
-  assert.ok(!fw.degraded, "不应进入降级态"); // 不降级
-  assert.equal(fw.thinkingCapped, 1); // 记了一次 capped
-  assert.equal(fw.consecutiveFailures ?? 0, 0); // 没累计失败
-});
-
-test("主模型非深度思考：空响应仍按真失败累计（不误赦免）", async () => {
-  const { guard, getStore } = makeFreshGuard({
-    getMainThinkingLevel: async () => "low", // 主模型非深度思考
-  });
-  const lines = ["[ERROR] [memory-ticker] 滚动摘要 (x.jsonl) 失败: 模型未回复正文，请检查思考内容或稍后重试。"];
-  await guard.tick(lines); // 第一次：累计 1
-  const r2 = await guard.tick(lines); // 第二次：触发降级
-  assert.equal(r2.action, "degraded");
-  const fw = getStore().failwatch;
-  assert.equal(fw.degraded, true);
+  assert.equal(r.action, "switched-to-backup");
+  assert.equal(currentModels.utility, BACKUP.utility);
+  assert.equal(notifications.length, 0);
 });

@@ -2,6 +2,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
   parseFailureSignal,
@@ -16,6 +19,15 @@ import {
   summarizeUsage,
   isDeepThinkingModel,
   isThinkingCappedFailure,
+  inferFailureSlot,
+  failureClass,
+  isImmediateFailure,
+  failureReason,
+  normalizeFailwatchSlots,
+  buildManualRestorePlan,
+  finalizeManualRestoreState,
+  listProtectedProviderSlots,
+  LogTail,
 } from "../lib/failwatch.js";
 
 // ── parseFailureSignal ──
@@ -106,6 +118,25 @@ test("非字符串返回 null", () => {
   assert.equal(parseFailureSignal(""), null);
 });
 
+test("失败信号按日志上下文归属三个独立槽位", () => {
+  assert.equal(parseFailureSignal("[ERROR] [llm] LLM_TIMEOUT utility")?.slot, "utility");
+  assert.equal(parseFailureSignal("[ERROR] [memory-ticker] compileFacts 失败: 超时")?.slot, "utility_large");
+  assert.equal(parseFailureSignal("[ERROR] [memory] Monthly usage limit reached")?.slot, "utility_large");
+  assert.equal(parseFailureSignal("[WARN] vision context injection failed")?.slot, "vision");
+  assert.equal(inferFailureSlot("[ERROR] memory summarizeActivity failed", "error"), "utility_large");
+});
+
+test("认证/额度/模型配置属于明确故障，其余归为临时波动", () => {
+  assert.equal(failureClass({ kind: "auth" }), "hard");
+  assert.equal(failureClass({ kind: "quota" }), "hard");
+  assert.equal(failureClass({ kind: "error", raw: "modelNotFound" }), "hard");
+  assert.equal(failureClass({ kind: "timeout" }), "transient");
+  assert.equal(failureClass({ kind: "network" }), "transient");
+  assert.equal(isImmediateFailure({ kind: "auth" }), true);
+  assert.equal(isImmediateFailure({ kind: "timeout" }), false);
+  assert.equal(failureReason({ kind: "vision" }), "识图调用失败");
+});
+
 // ── collectFailures ──
 
 test("collectFailures 收集带时间戳", () => {
@@ -117,6 +148,21 @@ test("collectFailures 收集带时间戳", () => {
   ], now);
   assert.equal(out.length, 2);
   assert.ok(out.every((f) => f.at === now));
+});
+
+test("LogTail.prime 从当前日志末尾开始，不重放历史故障", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "moxingxia-logtail-"));
+  try {
+    const file = path.join(dir, "2026-09-01.log");
+    fs.writeFileSync(file, "old line\n", "utf8");
+    const tail = new LogTail({ logsDir: dir });
+    assert.equal(tail.prime(), true);
+    assert.deepEqual(tail.readNewLines(), []);
+    fs.appendFileSync(file, "new line\n", "utf8");
+    assert.deepEqual(tail.readNewLines(), ["new line"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── decideDegrade ──
@@ -152,7 +198,7 @@ test("窗口过期重置计数", () => {
   assert.equal(r.nextState.consecutiveFailures, 1);
 });
 
-test("降级态不触发（等坚持期满切回试探）", () => {
+test("已降级槽位不重复触发，保持当前状态", () => {
   const recent = { degraded: true, degradedAt: Date.now() - 60 * 1000 };
   const r = decideDegrade(recent, { threshold: 2 });
   assert.equal(r.shouldDegrade, false);
@@ -311,29 +357,26 @@ test("parseFailureSignal：纯 vision 失败（无额度字样）识别为 visio
 
 // ── decideRestore ──
 
-test("降级态 + 坚持期满 → 切回试探（不再需要探测通过）", () => {
+test("默认手动恢复：坚持期满也不自动切回", () => {
   const state = { degraded: true, degradedAt: Date.now() - 6 * 60 * 1000 };
   const r = decideRestore(true, state, { holdMs: 5 * 60 * 1000 });
+  assert.equal(r.shouldRestore, false);
+  assert.equal(r.reason, "manual-only");
+  assert.equal(r.nextState.degraded, true);
+});
+
+test("自动恢复只在显式开启时可用（默认守护不会传入）", () => {
+  const state = { degraded: true, degradedAt: Date.now() - 6 * 60 * 1000 };
+  const r = decideRestore(false, state, { holdMs: 5 * 60 * 1000, autoRestore: true });
   assert.equal(r.shouldRestore, true);
   assert.equal(r.nextState.degraded, false);
 });
 
-test("降级态 + 坚持期满 + 探测失败 → 仍然切回（用真实调用当试金石）", () => {
-  const state = { degraded: true, degradedAt: Date.now() - 6 * 60 * 1000 };
-  const r = decideRestore(false, state, { holdMs: 5 * 60 * 1000 });
-  assert.equal(r.shouldRestore, true);
-});
-
-test("快速失败切换：默认 60 秒顶班后切回主模型", () => {
-  // 备用刚顶上 10 秒 → 不切回
+test("默认手动恢复：备用顶班时间长短都不改变恢复策略", () => {
   const fresh = { degraded: true, degradedAt: Date.now() - 10 * 1000 };
-  const r1 = decideRestore(true, fresh);
-  assert.equal(r1.shouldRestore, false);
-  // 备用顶上 61 秒 → 切回（默认 holdMs=60s）
   const old = { degraded: true, degradedAt: Date.now() - 61 * 1000 };
-  const r2 = decideRestore(true, old);
-  assert.equal(r2.shouldRestore, true);
-  assert.equal(r2.nextState.degraded, false);
+  assert.equal(decideRestore(true, fresh).shouldRestore, false);
+  assert.equal(decideRestore(true, old).shouldRestore, false);
 });
 
 test("降级态但坚持期未满 → 不切回", () => {
@@ -389,12 +432,22 @@ test("降级态第一次失败 → 计数，不停止", () => {
   assert.equal(r.nextState.standbyFailures, 1);
 });
 
-test("降级态连续两次失败 → 停止降级循环", () => {
+test("备用失败计数跨窗口会重新从 1 开始", () => {
+  const r = decideStandbyFailure(
+    { degraded: true, standbyFailures: 1, lastFailureAt: Date.now() - 10 * 60 * 1000 },
+    { standbyThreshold: 2, windowMs: 5 * 60 * 1000 },
+  );
+  assert.equal(r.shouldStop, false);
+  assert.equal(r.nextState.standbyFailures, 1);
+});
+
+test("降级态连续两次失败 → 标记备用失败但保持备用", () => {
   const r1 = decideStandbyFailure({ degraded: true }, { standbyThreshold: 2 });
   const r2 = decideStandbyFailure(r1.nextState, { standbyThreshold: 2 });
   assert.equal(r2.shouldStop, true);
   assert.equal(r2.nextState.standbyFailed, true);
-  assert.equal(r2.nextState.degraded, false);
+  assert.equal(r2.nextState.degraded, true);
+  assert.equal(r2.nextState.mode, "backup-failed");
 });
 
 // ── summarizeUsage ──
@@ -535,4 +588,69 @@ test("isStandbyConfig：非法入参返回 false", () => {
   assert.equal(isStandbyConfig(null, null), false);
   assert.equal(isStandbyConfig({}, null), false);
   assert.equal(isStandbyConfig(null, {}), false);
+});
+
+test("buildDegradePatch 可只切指定槽位", () => {
+  const cfg = { utility: "p/u", utility_large: "p/l", vision: "p/v" };
+  assert.deepEqual(buildDegradePatch(cfg, ["utility"]), { models: { utility: "p/u" } });
+  assert.deepEqual(buildDegradePatch(cfg, ["vision"]), { models: { vision: "p/v" } });
+});
+
+test("旧版单一降级状态可迁移成三槽视图", () => {
+  const slots = normalizeFailwatchSlots({
+    degraded: true,
+    degradedAt: 123,
+    lastDegradePatch: { models: { utility: "p/u", vision: "p/v" } },
+    snapshot: { utility: "main/u", vision: "main/v" },
+  });
+  assert.equal(slots.utility.mode, "backup");
+  assert.equal(slots.vision.mode, "backup");
+  assert.equal(slots.utility_large.mode, "primary");
+  assert.equal(slots.utility.snapshot, "main/u");
+});
+
+test("手动恢复计划只恢复仍保持备用配置的槽位", () => {
+  const fw = {
+    backup: { utility: "backup/u", vision: "backup/v" },
+    slots: {
+      utility: { mode: "backup", snapshot: "main/u", lastDegradePatch: { models: { utility: "backup/u" } } },
+      vision: { mode: "backup", snapshot: "main/v", lastDegradePatch: { models: { vision: "backup/v" } } },
+    },
+  };
+  const plan = buildManualRestorePlan(fw, { utility: "backup/u", vision: "user/vision" });
+  assert.deepEqual(plan.patch, { models: { utility: "main/u" } });
+  assert.deepEqual(plan.restoredSlots, ["utility"]);
+  assert.deepEqual(plan.skippedSlots, ["vision"]);
+  const next = finalizeManualRestoreState(fw, plan);
+  assert.equal(next.slots.utility.mode, "primary");
+  assert.equal(next.slots.vision.mode, "manual");
+  assert.equal(next.degraded, false);
+});
+
+test("两个槽位同时降级时，手动恢复计划合并 patch 且不带未降级槽位", () => {
+  const fw = {
+    backup: { utility: "backup/u", vision: "backup/v" },
+    slots: {
+      utility: { mode: "backup", snapshot: "main/u", lastDegradePatch: { models: { utility: "backup/u" } } },
+      utility_large: { mode: "primary" },
+      vision: { mode: "backup", snapshot: "main/v", lastDegradePatch: { models: { vision: "backup/v" } } },
+    },
+  };
+  const plan = buildManualRestorePlan(fw, {
+    utility: "backup/u",
+    utility_large: "main/l",
+    vision: "backup/v",
+  });
+  assert.deepEqual(plan.patch, { models: { utility: "main/u", vision: "main/v" } });
+  assert.deepEqual(plan.restoredSlots, ["utility", "vision"]);
+  assert.deepEqual(plan.skippedSlots, []);
+});
+
+test("当前与备用槽位都保护供应商不被收起", () => {
+  const protectedBy = listProtectedProviderSlots(
+    { utility: "main/u", vision: { provider: "vision-provider", id: "v" } },
+    { utility_large: "main/l", vision: "backup/v" },
+  );
+  assert.deepEqual(protectedBy.main.map((x) => x.slot), ["utility", "utility_large"]);
+  assert.deepEqual(protectedBy["vision-provider"].map((x) => x.slot), ["vision"]);
 });
